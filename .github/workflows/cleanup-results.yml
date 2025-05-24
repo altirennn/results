@@ -1,0 +1,27 @@
+name: Удалять results.json через 4 минуты после пуша
+
+on:
+  push:
+    paths:
+      - results.json
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@v3
+
+      - name: Настроить Git-пользователя
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ждать 4 минуты
+        run: sleep 240
+
+      - name: Удалить файл и закоммитить
+        run: |
+          git rm results.json
+          git commit -m "Авто: удаляю results.json спустя 4 минуты"
+          git push
