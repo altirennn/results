@@ -1,4 +1,4 @@
-name: Удалять results.json через 4 минуты после пуша
+name: Удалять results.json через 2 минуты после пуша
 
 permissions:
   contents: write
@@ -22,8 +22,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Ждать 4 минуты
-        run: sleep 240
+      - name: Ждать 2 минуты
+        run: sleep 160
 
       - name: Удалить results.json и закоммитить
         run: |
