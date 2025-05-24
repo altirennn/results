@@ -1,5 +1,8 @@
 name: Удалять results.json через 4 минуты после пуша
 
+permissions:
+  contents: write
+
 on:
   push:
     paths:
@@ -11,6 +14,8 @@ jobs:
     steps:
       - name: Забрать код
         uses: actions/checkout@v3
+        with:
+          persist-credentials: true
 
       - name: Настроить Git-пользователя
         run: |
@@ -20,8 +25,8 @@ jobs:
       - name: Ждать 4 минуты
         run: sleep 240
 
-      - name: Удалить файл и закоммитить
+      - name: Удалить results.json и закоммитить
         run: |
           git rm results.json
-          git commit -m "Авто: удаляю results.json спустя 4 минуты"
-          git push
+          git commit -m "Авто: удаляю results.json спустя 4 минуты" || echo "Nothing to commit"
+          git push || echo "Push failed"
