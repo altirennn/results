@@ -1,32 +1,171 @@
-name: Удалять results.json через 2 минуты после пуша
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import sharp from "sharp";
+import fetch from "node-fetch";
+import { v2 as cloudinary } from "cloudinary";
 
-permissions:
-  contents: write
+dotenv.config();
 
-on:
-  push:
-    paths:
-      - results.json
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "25mb" }));
 
-jobs:
-  cleanup:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Забрать код
-        uses: actions/checkout@v3
-        with:
-          persist-credentials: true
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
 
-      - name: Настроить Git-пользователя
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+const EACHLABS_API_KEY = process.env.EACHLABS_API_KEY;
+if (!EACHLABS_API_KEY) throw new Error("EACHLABS_API_KEY not set in .env");
 
-      - name: Ждать 2 минуты
-        run: sleep 60
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_USER = process.env.GITHUB_USER;
+const GITHUB_REPO = process.env.GITHUB_REPO;
+if (!GITHUB_TOKEN || !GITHUB_USER || !GITHUB_REPO) {
+  console.warn("⚠️ GitHub variables missing: skipping result upload");
+}
 
-      - name: Удалить results.json и закоммитить
-        run: |
-          git rm results.json
-          git commit -m "Авто: удаляю results.json спустя 4 минуты" || echo "Nothing to commit"
-          git push || echo "Push failed"
+const sessions = {}; // id -> { received: true, image: url }
+
+async function startEachlabsPrediction({ prompt, imageUrl }) {
+  const body = {
+    model: "openai-image-edit",
+    version: "0.0.1",
+    input: {
+      image_url_1: imageUrl,
+      prompt,
+      background: "auto",
+      image_size: "auto",
+      quality: "auto",
+      number_of_images: 1,
+    },
+  };
+  console.log("▶️ Sending to Eachlabs:", JSON.stringify(body.input, null, 2));
+
+  const res = await fetch("https://api.eachlabs.ai/v1/prediction/", {
+    method: "POST",
+    headers: {
+      "X-API-Key": EACHLABS_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const json = await res.json();
+  if (!res.ok || !json.predictionID) {
+    throw new Error(`Eachlabs error: ${JSON.stringify(json)}`);
+  }
+  console.log("🆔 Prediction ID:", json.predictionID);
+  return json.predictionID;
+}
+
+async function pollEachlabsResult(predictionId) {
+  const url = `https://api.eachlabs.ai/v1/prediction/${predictionId}`;
+  const headers = { "X-API-Key": EACHLABS_API_KEY };
+  const interval = 3000;
+  const timeout = 180000;
+  const maxTries = Math.ceil(timeout / interval);
+
+  for (let i = 0; i < maxTries; i++) {
+    await new Promise(r => setTimeout(r, interval));
+    const res = await fetch(url, { headers });
+    const json = await res.json();
+    console.log(`• polling [${i + 1}/${maxTries}]: status = ${json.status}`);
+
+    if (json.status === "success") {
+      return Array.isArray(json.output) ? json.output[0] : json.output;
+    }
+    if (json.status === "error") {
+      throw new Error(`Eachlabs failed: ${JSON.stringify(json)}`);
+    }
+  }
+
+  throw new Error("Timeout waiting for Eachlabs result");
+}
+
+async function getFileSha(path) {
+  if (!GITHUB_TOKEN) return null;
+  const res = await fetch(
+    `https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/contents/${path}`,
+    { headers: { Authorization: `token ${GITHUB_TOKEN}` } }
+  );
+  if (res.ok) {
+    const json = await res.json();
+    return json.sha;
+  }
+  return null;
+}
+
+async function uploadToGithub(path, data, commitMsg) {
+  if (!GITHUB_TOKEN) return;
+  const content = Buffer.from(JSON.stringify(data, null, 2)).toString("base64");
+  const sha = await getFileSha(path);
+  const res = await fetch(
+    `https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/contents/${path}`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: `token ${GITHUB_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ message: commitMsg, content, sha }),
+    }
+  );
+  if (!res.ok) console.error("GitHub upload error:", await res.text());
+  else console.log(`✔️ Uploaded ${path} to GitHub`);
+}
+
+app.get("/health", (_, res) => res.send("OK"));
+
+app.get("/status", (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: "Missing id" });
+  const session = sessions[id];
+  if (!session) return res.json({ received: false });
+  res.json({ received: true, image: session.image || null });
+});
+
+app.post("/", async (req, res) => {
+  const start = Date.now();
+  try {
+    const { id, prompt, photo } = req.body;
+    if (!prompt || !photo) {
+      return res.status(400).json({ error: "Missing prompt or photo" });
+    }
+
+    const b64 = photo.includes("base64,") ? photo.split("base64,")[1] : photo;
+    const buffer = Buffer.from(b64, "base64");
+    const resized = await sharp(buffer)
+      .resize(512, 512, { fit: "cover" })
+      .png()
+      .toBuffer();
+
+    const uploadRes = await new Promise((ok, fail) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: "ai-booth", format: "png" },
+        (err, result) => (err ? fail(err) : ok(result))
+      );
+      stream.end(resized);
+    });
+    console.log("✔️ Uploaded to Cloudinary:", uploadRes.secure_url);
+
+    const predictionId = await startEachlabsPrediction({ prompt, imageUrl: uploadRes.secure_url });
+    const finalUrl = await pollEachlabsResult(predictionId);
+    console.log("✔️ Eachlabs result URL:", finalUrl);
+
+    const resultData = { id, prompt, image: finalUrl, timestamp: new Date().toISOString() };
+    sessions[id] = resultData;
+    await uploadToGithub("results.json", resultData, `chore: result for ${id}`);
+
+    console.log(`✅ Completed in ${(Date.now() - start) / 1000}s`);
+    res.json({ success: true, image: finalUrl });
+  } catch (err) {
+    console.error("❌ Error", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
