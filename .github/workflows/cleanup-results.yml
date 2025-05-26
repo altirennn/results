@@ -23,7 +23,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Ждать 2 минуты
-        run: sleep 160
+        run: sleep 30
 
       - name: Удалить results.json и закоммитить
         run: |
